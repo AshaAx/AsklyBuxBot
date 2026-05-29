@@ -1,9 +1,10 @@
 import telebot
-import pyrebase
+import firebase_admin
+from firebase_admin import credentials, db
 import json
 import os
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 import re
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
 # Railway variable থেকে Firebase config নেওয়া
 firebase_json = os.environ.get("FIREBASE_CONFIG")
@@ -12,31 +13,31 @@ if not firebase_json:
 
 firebase_config = json.loads(firebase_json)
 
-# Firebase initialization
-firebase = pyrebase.initialize_app(firebase_config)
-db = firebase.database()
+# Firebase Admin SDK initialization
+cred = credentials.Certificate(firebase_config)
+firebase_admin.initialize_app(cred, {
+    'databaseURL': f"https://{firebase_config['project_id']}.firebaseio.com/"
+})
 
-# Bot token (Railway variable থেকেও নেওয়া ভালো)
+# Bot token
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # আপনার চ্যাট আইডি দিন
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 
-# ------------------- Helper Functions -------------------
+# Helper Functions
 def is_logged_in(user_id):
-    """চেক করে user লগইন করেছে কিনা"""
-    user = db.child("users").child(str(user_id)).get()
-    if user.val():
-        return user.val().get("logged_in", False)
-    return False
+    ref = db.reference(f'users/{user_id}')
+    user = ref.get()
+    return user.get("logged_in", False) if user else False
 
 def get_user_data(user_id):
-    """user এর সব তথ্য নেয়"""
-    return db.child("users").child(str(user_id)).get().val()
+    ref = db.reference(f'users/{user_id}')
+    return ref.get()
 
 def save_account(user_id, account_name, username, password, twofa):
-    """account সংরক্ষণ করে"""
-    db.child("accounts").child(str(user_id)).child(account_name).set({
+    ref = db.reference(f'accounts/{user_id}/{account_name}')
+    ref.set({
         "username": username,
         "password": password,
         "twofa": twofa if twofa != "none" else None
@@ -44,38 +45,35 @@ def save_account(user_id, account_name, username, password, twofa):
     return True
 
 def get_all_accounts(user_id):
-    """user এর সব account এর নাম লিস্ট আকারে রিটার্ন করে"""
-    accounts = db.child("accounts").child(str(user_id)).get()
-    if accounts.val():
-        return list(accounts.val().keys())
+    ref = db.reference(f'accounts/{user_id}')
+    accounts = ref.get()
+    if accounts:
+        return list(accounts.keys())
     return []
 
 def get_account_details(user_id, account_name):
-    """নির্দিষ্ট account এর বিবরণ দেয়"""
-    account = db.child("accounts").child(str(user_id)).child(account_name).get()
-    return account.val()
+    ref = db.reference(f'accounts/{user_id}/{account_name}')
+    return ref.get()
 
 def delete_account(user_id, account_name):
-    """account ডিলিট করে"""
-    db.child("accounts").child(str(user_id)).child(account_name).remove()
+    ref = db.reference(f'accounts/{user_id}/{account_name}')
+    ref.delete()
     return True
 
-# ------------------- Main Menu Keyboard -------------------
+# Main Menu Keyboard
 def main_menu_keyboard():
-    """লগইনের পর main menu এর reply keyboard"""
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     btn1 = KeyboardButton("📑 Save Account")
     btn2 = KeyboardButton("💝 Your Account's")
     keyboard.add(btn1, btn2)
     return keyboard
 
-# ------------------- Start Command -------------------
+# Start Command
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.chat.id
     name = message.from_user.first_name
     
-    # Inline keyboard for Sign Up/Login
     keyboard = InlineKeyboardMarkup(row_width=2)
     signup_btn = InlineKeyboardButton("📋 Sign Up", callback_data="signup")
     login_btn = InlineKeyboardButton("🎉 Login", callback_data="login")
@@ -91,7 +89,7 @@ def send_welcome(message):
         parse_mode="Markdown"
     )
 
-# ------------------- Sign Up & Login Callbacks -------------------
+# Sign Up & Login
 @bot.callback_query_handler(func=lambda call: call.data in ["signup", "login"])
 def auth_handler(call):
     user_id = call.message.chat.id
@@ -99,9 +97,9 @@ def auth_handler(call):
     if call.data == "signup":
         msg = bot.send_message(user_id, "🔐 আপনার ইউজারনেম লিখুন (শুধু ইংরেজি অক্ষর ও সংখ্যা):")
         bot.register_next_step_handler(msg, signup_username)
-    else:  # login
-        user_data = db.child("users").child(str(user_id)).get()
-        if user_data.val() and user_data.val().get("password"):
+    else:
+        user_data = get_user_data(user_id)
+        if user_data and user_data.get("password"):
             msg = bot.send_message(user_id, "🔑 আপনার পাসওয়ার্ড লিখুন:")
             bot.register_next_step_handler(msg, login_password)
         else:
@@ -117,8 +115,8 @@ def signup_username(message):
         bot.register_next_step_handler(msg, signup_username)
         return
     
-    # Store username temporarily
-    db.child("temp").child(str(user_id)).set({"username": username})
+    temp_ref = db.reference(f'temp/{user_id}')
+    temp_ref.set({"username": username})
     msg = bot.send_message(user_id, "🔒 আপনার পাসওয়ার্ড লিখুন (মিনিমাম ৪ অক্ষর):")
     bot.register_next_step_handler(msg, signup_password)
 
@@ -132,20 +130,19 @@ def signup_password(message):
         bot.register_next_step_handler(msg, signup_password)
         return
     
-    temp_data = db.child("temp").child(str(user_id)).get().val()
+    temp_ref = db.reference(f'temp/{user_id}')
+    temp_data = temp_ref.get()
     username = temp_data.get("username")
     
-    # Save user
-    db.child("users").child(str(user_id)).set({
+    user_ref = db.reference(f'users/{user_id}')
+    user_ref.set({
         "username": username,
         "password": password,
         "logged_in": True
     })
     
-    # Clean temp
-    db.child("temp").child(str(user_id)).remove()
+    temp_ref.delete()
     
-    # Admin notification
     chat_full_name = f"{message.from_user.first_name} {message.from_user.last_name if message.from_user.last_name else ''}"
     admin_msg = (
         f"🆕 **নতুন ইউজার সাইনআপ করেছে!**\n\n"
@@ -162,14 +159,15 @@ def login_password(message):
     user_id = message.chat.id
     password = message.text.strip()
     
-    user_data = db.child("users").child(str(user_id)).get().val()
+    user_data = get_user_data(user_id)
     if user_data and user_data.get("password") == password:
-        db.child("users").child(str(user_id)).update({"logged_in": True})
+        user_ref = db.reference(f'users/{user_id}')
+        user_ref.update({"logged_in": True})
         bot.send_message(user_id, "✅ লগইন সফল! স্বাগতম 🤗", reply_markup=main_menu_keyboard())
     else:
         bot.send_message(user_id, "❌ ভুল পাসওয়ার্ড! আবার চেষ্টা করুন। /start দিয়ে চেষ্টা করুন।")
 
-# ------------------- Save Account -------------------
+# Save Account
 @bot.message_handler(func=lambda message: message.text == "📑 Save Account")
 def save_account_start(message):
     user_id = message.chat.id
@@ -184,36 +182,40 @@ def get_account_name(message):
     user_id = message.chat.id
     account_name = message.text.strip().lower()
     
-    # Check if account name already exists
-    existing = db.child("accounts").child(str(user_id)).child(account_name).get().val()
+    acc_ref = db.reference(f'accounts/{user_id}/{account_name}')
+    existing = acc_ref.get()
     if existing:
         bot.send_message(user_id, "⚠️ এই নামে আগেই একটি অ্যাকাউন্ট আছে! ভিন্ন নাম দিন।")
         msg = bot.send_message(user_id, "নতুন নাম লিখুন:")
         bot.register_next_step_handler(msg, get_account_name)
         return
     
-    db.child("temp_save").child(str(user_id)).set({"acc_name": account_name})
+    temp_ref = db.reference(f'temp_save/{user_id}')
+    temp_ref.set({"acc_name": account_name})
     msg = bot.send_message(user_id, "👤 ইউজারনেম লিখুন:")
     bot.register_next_step_handler(msg, get_username)
 
 def get_username(message):
     user_id = message.chat.id
     username = message.text.strip()
-    db.child("temp_save").child(str(user_id)).update({"username": username})
+    temp_ref = db.reference(f'temp_save/{user_id}')
+    temp_ref.update({"username": username})
     msg = bot.send_message(user_id, "🔑 পাসওয়ার্ড লিখুন:")
     bot.register_next_step_handler(msg, get_password)
 
 def get_password(message):
     user_id = message.chat.id
     password = message.text.strip()
-    db.child("temp_save").child(str(user_id)).update({"password": password})
+    temp_ref = db.reference(f'temp_save/{user_id}')
+    temp_ref.update({"password": password})
     msg = bot.send_message(user_id, "🔐 2FA কী লিখুন (যদি না থাকে 'none' লিখুন):")
     bot.register_next_step_handler(msg, get_twofa)
 
 def get_twofa(message):
     user_id = message.chat.id
     twofa = message.text.strip()
-    temp_data = db.child("temp_save").child(str(user_id)).get().val()
+    temp_ref = db.reference(f'temp_save/{user_id}')
+    temp_data = temp_ref.get()
     
     if temp_data:
         save_account(
@@ -223,12 +225,12 @@ def get_twofa(message):
             temp_data["password"],
             twofa
         )
-        db.child("temp_save").child(str(user_id)).remove()
+        temp_ref.delete()
         bot.send_message(user_id, f"✅ অ্যাকাউন্ট `{temp_data['acc_name']}` সফলভাবে সংরক্ষণ করা হয়েছে!", parse_mode="Markdown")
     else:
         bot.send_message(user_id, "❌ কিছু ভুল হয়েছে! আবার চেষ্টা করুন।")
 
-# ------------------- Your Account's (Show all accounts) -------------------
+# Your Account's
 @bot.message_handler(func=lambda message: message.text == "💝 Your Account's")
 def show_accounts(message):
     user_id = message.chat.id
@@ -241,26 +243,24 @@ def show_accounts(message):
         bot.send_message(user_id, "📭 এখনও কোনো অ্যাকাউন্ট সংরক্ষণ করা হয়নি।\n'📑 Save Account' দিয়ে সংরক্ষণ করুন।")
         return
     
-    # Inline keyboard for account selection
     keyboard = InlineKeyboardMarkup(row_width=2)
     for acc in accounts:
         btn = InlineKeyboardButton(acc.capitalize(), callback_data=f"view_{acc}")
         keyboard.add(btn)
     
-    # Delete button
     keyboard.add(InlineKeyboardButton("🗑️ অ্যাকাউন্ট ডিলিট", callback_data="delete_menu"))
     keyboard.add(InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_to_menu"))
     
     bot.send_message(user_id, "📋 আপনার সংরক্ষিত অ্যাকাউন্টগুলোর তালিকা:", reply_markup=keyboard)
 
-# ------------------- View Single Account with Security -------------------
+# View Account with Security
 @bot.callback_query_handler(func=lambda call: call.data.startswith("view_"))
 def view_account(call):
     user_id = call.message.chat.id
     account_name = call.data.split("_", 1)[1]
     
-    # Save which account they want to view
-    db.child("temp_view").child(str(user_id)).set({"account": account_name})
+    temp_ref = db.reference(f'temp_view/{user_id}')
+    temp_ref.set({"account": account_name})
     
     bot.send_message(user_id, f"🔒 নিরাপত্তার জন্য আপনার মাস্টার পাসওয়ার্ড দিন:\n(যেটি Sign Up এ দিয়েছিলেন)")
     msg = bot.send_message(user_id, "পাসওয়ার্ড লিখুন:")
@@ -272,10 +272,10 @@ def verify_master_password(message):
     
     user_data = get_user_data(user_id)
     if user_data and user_data.get("password") == entered_pass:
-        # Password matched, show account details
-        temp = db.child("temp_view").child(str(user_id)).get().val()
-        if temp:
-            acc_name = temp["account"]
+        temp_ref = db.reference(f'temp_view/{user_id}')
+        temp_data = temp_ref.get()
+        if temp_data:
+            acc_name = temp_data["account"]
             acc_details = get_account_details(user_id, acc_name)
             if acc_details:
                 twofa_text = f"🔐 2FA: `{acc_details['twofa']}`" if acc_details.get('twofa') else "🔐 2FA: নেই"
@@ -288,12 +288,12 @@ def verify_master_password(message):
                 bot.send_message(user_id, msg_text, parse_mode="Markdown")
             else:
                 bot.send_message(user_id, "❌ অ্যাকাউন্ট পাওয়া যায়নি!")
-        db.child("temp_view").child(str(user_id)).remove()
+        temp_ref.delete()
     else:
         bot.send_message(user_id, "⚠️ **ভুল পাসওয়ার্ড!** অননুমোদিত প্রবেশ আটকানো হয়েছে।", parse_mode="Markdown")
         bot.send_message(user_id, "🏠 হোম মেনুতে ফিরে আসছেন...", reply_markup=main_menu_keyboard())
 
-# ------------------- Delete Menu -------------------
+# Delete Menu
 @bot.callback_query_handler(func=lambda call: call.data == "delete_menu")
 def delete_menu(call):
     user_id = call.message.chat.id
@@ -318,7 +318,6 @@ def confirm_delete(call):
     delete_account(user_id, account_name)
     bot.answer_callback_query(call.id, f"{account_name} ডিলিট করা হয়েছে!")
     
-    # Show updated list
     accounts = get_all_accounts(user_id)
     if accounts:
         keyboard = InlineKeyboardMarkup(row_width=2)
@@ -331,7 +330,7 @@ def confirm_delete(call):
         bot.edit_message_text("📭 এখন কোনো অ্যাকাউন্ট নেই।", user_id, call.message.message_id)
         bot.send_message(user_id, "🔙 মেনু:", reply_markup=main_menu_keyboard())
 
-# ------------------- Back to Menu -------------------
+# Back to Menu
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
 def back_to_menu(call):
     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
@@ -341,7 +340,7 @@ def back_to_menu(call):
 def back_to_accounts(call):
     show_accounts(call.message)
 
-# ------------------- Remove Command (Optional) -------------------
+# Remove Command
 @bot.message_handler(commands=['remove'])
 def remove_command(message):
     user_id = message.chat.id
@@ -355,14 +354,14 @@ def remove_command(message):
         return
     
     acc_name = parts[1].lower()
-    acc = db.child("accounts").child(str(user_id)).child(acc_name).get().val()
+    acc = get_account_details(user_id, acc_name)
     if acc:
         delete_account(user_id, acc_name)
         bot.send_message(user_id, f"✅ `{acc_name}` ডিলিট করা হয়েছে!", parse_mode="Markdown")
     else:
         bot.send_message(user_id, "❌ এই নামে কোনো অ্যাকাউন্ট নেই!")
 
-# ------------------- Run Bot -------------------
+# Run Bot
 if __name__ == "__main__":
-    print("🤖 Bot is running...")
+    print("🤖 Bot is running with Firebase Admin SDK...")
     bot.infinity_polling()

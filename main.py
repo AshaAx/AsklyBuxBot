@@ -1,367 +1,532 @@
-import telebot
+import os
+import json
+import logging
 import firebase_admin
 from firebase_admin import credentials, db
-import json
-import os
-import re
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
 
-# Railway variable থেকে Firebase config নেওয়া
-firebase_json = os.environ.get("FIREBASE_CONFIG")
-if not firebase_json:
-    raise Exception("FIREBASE_CONFIG environment variable not found!")
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-firebase_config = json.loads(firebase_json)
-
-# Firebase Admin SDK initialization
-cred = credentials.Certificate(firebase_config)
-firebase_admin.initialize_app(cred, {
-    'databaseURL': f"https://{firebase_config['project_id']}.firebaseio.com/"
-})
-
-# Bot token
+# ─────────────────────────────────────────────
+# ENV VARIABLES (Railway Variables থেকে নেওয়া হবে)
+# ─────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-bot = telebot.TeleBot(BOT_TOKEN)
+FIREBASE_DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL")  # e.g. https://your-project-default-rtdb.firebaseio.com
+FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")  # JSON string
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0"))  # তোমার নিজের chat_id
 
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+# ─────────────────────────────────────────────
+# FIREBASE INIT
+# ─────────────────────────────────────────────
+cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
+cred = credentials.Certificate(cred_dict)
+firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DATABASE_URL})
 
-# Helper Functions
-def is_logged_in(user_id):
-    ref = db.reference(f'users/{user_id}')
-    user = ref.get()
-    return user.get("logged_in", False) if user else False
+# ─────────────────────────────────────────────
+# CONVERSATION STATES
+# ─────────────────────────────────────────────
+(
+    MAIN_MENU,
+    SIGNUP_USERNAME, SIGNUP_PASSWORD,
+    LOGIN_USERNAME, LOGIN_PASSWORD,
+    SAVE_ACC_NAME, SAVE_ACC_USERNAME, SAVE_ACC_PASSWORD, SAVE_ACC_2FA,
+    VERIFY_PASSWORD,
+) = range(10)
 
-def get_user_data(user_id):
-    ref = db.reference(f'users/{user_id}')
-    return ref.get()
+# ─────────────────────────────────────────────
+# KEYBOARDS
+# ─────────────────────────────────────────────
+def get_start_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 𝙎𝙞𝙜𝙣 𝙐𝙥", callback_data="signup")],
+        [InlineKeyboardButton("🎉 𝙇𝙤𝙜𝙞𝙣", callback_data="login")],
+    ])
 
-def save_account(user_id, account_name, username, password, twofa):
-    ref = db.reference(f'accounts/{user_id}/{account_name}')
-    ref.set({
+def get_home_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📑 𝙎𝙖𝙫𝙚 𝘼𝙘𝙘𝙤𝙪𝙣𝙩")],
+            [KeyboardButton("💝 𝙔𝙤𝙪𝙧 𝘼𝙘𝙘𝙤𝙪𝙣𝙩'𝙨")],
+        ],
+        resize_keyboard=True
+    )
+
+# ─────────────────────────────────────────────
+# FIREBASE HELPERS
+# ─────────────────────────────────────────────
+def fb_get(path):
+    try:
+        return db.reference(path).get()
+    except Exception:
+        return None
+
+def fb_set(path, data):
+    db.reference(path).set(data)
+
+def fb_delete(path):
+    db.reference(path).delete()
+
+def get_user_by_username(username):
+    users = fb_get("users") or {}
+    for uid, udata in users.items():
+        if udata.get("username", "").lower() == username.lower():
+            return uid, udata
+    return None, None
+
+def get_user_by_chat_id(chat_id):
+    return fb_get(f"users/{chat_id}")
+
+def is_logged_in(chat_id):
+    udata = get_user_by_chat_id(chat_id)
+    return udata is not None and udata.get("logged_in", False)
+
+# ─────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = user.id
+
+    # Admin কে নতুন user এর info পাঠাও
+    if ADMIN_CHAT_ID:
+        admin_msg = (
+            f"🔔 *New /start triggered!*\n\n"
+            f"👤 Full Name: {user.full_name}\n"
+            f"🆔 Username: @{user.username or 'N/A'}\n"
+            f"💬 Chat ID: `{chat_id}`"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=admin_msg,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Admin notify failed: {e}")
+
+    # Already logged in?
+    if is_logged_in(chat_id):
+        await update.message.reply_text(
+            f"👋 Welcome back, *{user.first_name}*!\nYou are already logged in.",
+            parse_mode="Markdown",
+            reply_markup=get_home_keyboard()
+        )
+        return MAIN_MENU
+
+    await update.message.reply_text(
+        f"👋 *Welcome to Account Saver Bot!*\n\n"
+        f"Securely save and manage your accounts.\n\n"
+        f"Please *Sign Up* or *Login* to continue:",
+        parse_mode="Markdown",
+        reply_markup=get_start_keyboard()
+    )
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# SIGN UP FLOW
+# ─────────────────────────────────────────────
+async def signup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📋 *Sign Up*\n\nPlease enter a *username* for your account:", parse_mode="Markdown")
+    return SIGNUP_USERNAME
+
+async def signup_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip()
+    if " " in username:
+        await update.message.reply_text("❌ Username cannot contain spaces. Try again:")
+        return SIGNUP_USERNAME
+
+    # Check if username already taken
+    uid, _ = get_user_by_username(username)
+    if uid is not None:
+        await update.message.reply_text("❌ Username already taken. Choose another:")
+        return SIGNUP_USERNAME
+
+    context.user_data["signup_username"] = username
+    await update.message.reply_text(f"✅ Username: *{username}*\n\nNow enter a *password*:", parse_mode="Markdown")
+    return SIGNUP_PASSWORD
+
+async def signup_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    chat_id = update.effective_user.id
+    user = update.effective_user
+    username = context.user_data["signup_username"]
+
+    # Save to Firebase
+    fb_set(f"users/{chat_id}", {
         "username": username,
         "password": password,
-        "twofa": twofa if twofa != "none" else None
+        "full_name": user.full_name,
+        "tg_username": user.username or "",
+        "logged_in": True,
+        "accounts": {}
     })
-    return True
 
-def get_all_accounts(user_id):
-    ref = db.reference(f'accounts/{user_id}')
-    accounts = ref.get()
-    if accounts:
-        return list(accounts.keys())
-    return []
+    await update.message.reply_text(
+        f"🎉 *Account Created Successfully!*\n\n"
+        f"Welcome, *{username}*!\nYou are now logged in.",
+        parse_mode="Markdown",
+        reply_markup=get_home_keyboard()
+    )
+    return MAIN_MENU
 
-def get_account_details(user_id, account_name):
-    ref = db.reference(f'accounts/{user_id}/{account_name}')
-    return ref.get()
+# ─────────────────────────────────────────────
+# LOGIN FLOW
+# ─────────────────────────────────────────────
+async def login_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("🎉 *Login*\n\nEnter your *username*:", parse_mode="Markdown")
+    return LOGIN_USERNAME
 
-def delete_account(user_id, account_name):
-    ref = db.reference(f'accounts/{user_id}/{account_name}')
-    ref.delete()
-    return True
+async def login_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip()
+    uid, udata = get_user_by_username(username)
+    if uid is None:
+        await update.message.reply_text("❌ Username not found. Try again:")
+        return LOGIN_USERNAME
 
-# Main Menu Keyboard
-def main_menu_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn1 = KeyboardButton("📑 Save Account")
-    btn2 = KeyboardButton("💝 Your Account's")
-    keyboard.add(btn1, btn2)
-    return keyboard
+    context.user_data["login_uid"] = uid
+    context.user_data["login_udata"] = udata
+    await update.message.reply_text("🔑 Enter your *password*:", parse_mode="Markdown")
+    return LOGIN_PASSWORD
 
-# Start Command
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.chat.id
-    name = message.from_user.first_name
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    signup_btn = InlineKeyboardButton("📋 Sign Up", callback_data="signup")
-    login_btn = InlineKeyboardButton("🎉 Login", callback_data="login")
-    keyboard.add(signup_btn, login_btn)
-    
-    bot.send_message(
-        user_id,
-        f"🎯 হ্যালো {name}! 👋\n\n"
-        f"🔥 এটি একটি **Account Saver Bot**\n"
-        f"💾 এখানে আপনার বিভিন্ন অ্যাকাউন্ট সংরক্ষণ করুন\n\n"
-        f"✏️ শুরু করতে নিচের Sign Up বা Login এ ক্লিক করুন:",
-        reply_markup=keyboard,
+async def login_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    password = update.message.text.strip()
+    chat_id = update.effective_user.id
+    uid = context.user_data["login_uid"]
+    udata = context.user_data["login_udata"]
+
+    if udata.get("password") != password:
+        await update.message.reply_text("❌ Wrong password! Try again with /start")
+        return ConversationHandler.END
+
+    # If logging in from a different device/chat_id, update reference
+    if str(uid) != str(chat_id):
+        await update.message.reply_text("⚠️ This account is registered to a different Telegram account.")
+        return ConversationHandler.END
+
+    fb_set(f"users/{chat_id}/logged_in", True)
+
+    await update.message.reply_text(
+        f"✅ *Logged in successfully!*\n\nWelcome back, *{udata.get('username')}*!",
+        parse_mode="Markdown",
+        reply_markup=get_home_keyboard()
+    )
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# MAIN MENU HANDLER (Reply Keyboard)
+# ─────────────────────────────────────────────
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_id = update.effective_user.id
+
+    if not is_logged_in(chat_id):
+        await update.message.reply_text("Please /start first.")
+        return MAIN_MENU
+
+    if text == "📑 𝙎𝙖𝙫𝙚 𝘼𝙘𝙘𝙤𝙪𝙣𝙩":
+        await update.message.reply_text(
+            "💾 *Save Account*\n\nEnter a *name* for this account (e.g. Gmail, Facebook):",
+            parse_mode="Markdown"
+        )
+        return SAVE_ACC_NAME
+
+    elif text == "💝 𝙔𝙤𝙪𝙧 𝘼𝙘𝙘𝙤𝙪𝙣𝙩'𝙨":
+        return await show_accounts(update, context)
+
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# SAVE ACCOUNT FLOW
+# ─────────────────────────────────────────────
+async def save_acc_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    name = update.message.text.strip()
+
+    if "/" in name or " " in name:
+        await update.message.reply_text("❌ Account name cannot have spaces or '/'. Try again:")
+        return SAVE_ACC_NAME
+
+    # Check duplicate
+    existing = fb_get(f"users/{chat_id}/accounts/{name}")
+    if existing:
+        await update.message.reply_text(f"❌ An account named *{name}* already exists. Use a different name:", parse_mode="Markdown")
+        return SAVE_ACC_NAME
+
+    context.user_data["save_acc_name"] = name
+    await update.message.reply_text(f"✅ Name: *{name}*\n\nEnter the *username* for this account:", parse_mode="Markdown")
+    return SAVE_ACC_USERNAME
+
+async def save_acc_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["save_acc_user"] = update.message.text.strip()
+    await update.message.reply_text("🔑 Enter the *password* for this account:", parse_mode="Markdown")
+    return SAVE_ACC_PASSWORD
+
+async def save_acc_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["save_acc_pass"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🔐 Enter the *2FA key* for this account.\n\n"
+        "If no 2FA, type `none`:",
         parse_mode="Markdown"
     )
+    return SAVE_ACC_2FA
 
-# Sign Up & Login
-@bot.callback_query_handler(func=lambda call: call.data in ["signup", "login"])
-def auth_handler(call):
-    user_id = call.message.chat.id
-    
-    if call.data == "signup":
-        msg = bot.send_message(user_id, "🔐 আপনার ইউজারনেম লিখুন (শুধু ইংরেজি অক্ষর ও সংখ্যা):")
-        bot.register_next_step_handler(msg, signup_username)
-    else:
-        user_data = get_user_data(user_id)
-        if user_data and user_data.get("password"):
-            msg = bot.send_message(user_id, "🔑 আপনার পাসওয়ার্ড লিখুন:")
-            bot.register_next_step_handler(msg, login_password)
-        else:
-            bot.send_message(user_id, "❌ আপনার কোন একাউন্ট নেই! প্রথমে /start দিয়ে Sign Up করুন।")
+async def save_acc_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    twofa = update.message.text.strip()
+    if twofa.lower() == "none":
+        twofa = None
 
-def signup_username(message):
-    user_id = message.chat.id
-    username = message.text.strip()
-    
-    if not re.match("^[a-zA-Z0-9_]+$", username):
-        bot.send_message(user_id, "❌ ইউজারনেম শুধু ইংরেজি অক্ষর, সংখ্যা ও আন্ডারস্কোর থাকতে পারে। আবার চেষ্টা করুন:")
-        msg = bot.send_message(user_id, "ইউজারনেম লিখুন:")
-        bot.register_next_step_handler(msg, signup_username)
-        return
-    
-    temp_ref = db.reference(f'temp/{user_id}')
-    temp_ref.set({"username": username})
-    msg = bot.send_message(user_id, "🔒 আপনার পাসওয়ার্ড লিখুন (মিনিমাম ৪ অক্ষর):")
-    bot.register_next_step_handler(msg, signup_password)
+    name = context.user_data["save_acc_name"]
+    acc_user = context.user_data["save_acc_user"]
+    acc_pass = context.user_data["save_acc_pass"]
 
-def signup_password(message):
-    user_id = message.chat.id
-    password = message.text.strip()
-    
-    if len(password) < 4:
-        bot.send_message(user_id, "❌ পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে। আবার লিখুন:")
-        msg = bot.send_message(user_id, "পাসওয়ার্ড লিখুন:")
-        bot.register_next_step_handler(msg, signup_password)
-        return
-    
-    temp_ref = db.reference(f'temp/{user_id}')
-    temp_data = temp_ref.get()
-    username = temp_data.get("username")
-    
-    user_ref = db.reference(f'users/{user_id}')
-    user_ref.set({
-        "username": username,
-        "password": password,
-        "logged_in": True
-    })
-    
-    temp_ref.delete()
-    
-    chat_full_name = f"{message.from_user.first_name} {message.from_user.last_name if message.from_user.last_name else ''}"
-    admin_msg = (
-        f"🆕 **নতুন ইউজার সাইনআপ করেছে!**\n\n"
-        f"👤 নাম: {chat_full_name}\n"
-        f"🆔 ইউজারনেম: @{message.from_user.username if message.from_user.username else 'N/A'}\n"
-        f"📱 চ্যাট আইডি: `{user_id}`\n"
-        f"🔐 সেট করা ইউজারনেম: {username}"
+    acc_data = {
+        "username": acc_user,
+        "password": acc_pass,
+    }
+    if twofa:
+        acc_data["2fa"] = twofa
+
+    fb_set(f"users/{chat_id}/accounts/{name}", acc_data)
+
+    await update.message.reply_text(
+        f"✅ *Account saved!*\n\n"
+        f"Use `/account {name}` to view it.",
+        parse_mode="Markdown",
+        reply_markup=get_home_keyboard()
     )
-    bot.send_message(ADMIN_CHAT_ID, admin_msg, parse_mode="Markdown")
-    
-    bot.send_message(user_id, "✅ সফলভাবে অ্যাকাউন্ট তৈরি হয়েছে! 🎉", reply_markup=main_menu_keyboard())
+    return MAIN_MENU
 
-def login_password(message):
-    user_id = message.chat.id
-    password = message.text.strip()
-    
-    user_data = get_user_data(user_id)
-    if user_data and user_data.get("password") == password:
-        user_ref = db.reference(f'users/{user_id}')
-        user_ref.update({"logged_in": True})
-        bot.send_message(user_id, "✅ লগইন সফল! স্বাগতম 🤗", reply_markup=main_menu_keyboard())
+# ─────────────────────────────────────────────
+# SHOW ALL ACCOUNTS
+# ─────────────────────────────────────────────
+async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    accounts = fb_get(f"users/{chat_id}/accounts") or {}
+
+    if not accounts:
+        await update.message.reply_text("📭 You have no saved accounts yet.\n\nUse *📑 Save Account* to add one.", parse_mode="Markdown")
+        return MAIN_MENU
+
+    msg = "💝 *Your Saved Accounts:*\n\n"
+    for name in accounts:
+        msg += f"• `/account {name}`\n"
+    msg += "\n_Tap a command to view account details._\n"
+    msg += "_Use_ `/remove <name>` _to delete an account._"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# /account <name> COMMAND — with security check
+# ─────────────────────────────────────────────
+async def view_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/account <account_name>`", parse_mode="Markdown")
+        return MAIN_MENU
+
+    name = context.args[0].strip()
+
+    # Fetch the owner of this name from ALL users (security: name is unique per bot-account, not global)
+    udata = get_user_by_chat_id(chat_id)
+    if not udata:
+        await update.message.reply_text("Please /start and login first.")
+        return MAIN_MENU
+
+    accounts = udata.get("accounts", {})
+
+    if name not in accounts:
+        # Check if someone else has this account name — security flow
+        # We check every user for this account name
+        all_users = fb_get("users") or {}
+        found_owner = None
+        for uid, ud in all_users.items():
+            if str(uid) == str(chat_id):
+                continue
+            if name in (ud.get("accounts") or {}):
+                found_owner = ud
+                break
+
+        if found_owner:
+            # Someone is trying to access another user's account — demand password
+            context.user_data["security_check_name"] = name
+            context.user_data["security_check_owner_uid"] = None
+            for uid, ud in all_users.items():
+                if name in (ud.get("accounts") or {}):
+                    context.user_data["security_check_owner_uid"] = uid
+                    break
+            await update.message.reply_text(
+                "🔒 *Security Check!*\n\nThis account belongs to another user.\n"
+                "Enter the *owner's bot password* to proceed:",
+                parse_mode="Markdown"
+            )
+            return VERIFY_PASSWORD
+        else:
+            await update.message.reply_text(f"❌ No account named *{name}* found.", parse_mode="Markdown")
+            return MAIN_MENU
+
+    # Owner is accessing their own account
+    acc = accounts[name]
+    msg = (
+        f"📋 *Account:* `{name}`\n\n"
+        f"👤 Username: `{acc.get('username', 'N/A')}`\n"
+        f"🔑 Password: `{acc.get('password', 'N/A')}`\n"
+    )
+    if acc.get("2fa"):
+        msg += f"🔐 2FA Key: `{acc.get('2fa')}`\n"
     else:
-        bot.send_message(user_id, "❌ ভুল পাসওয়ার্ড! আবার চেষ্টা করুন। /start দিয়ে চেষ্টা করুন।")
+        msg += "🔐 2FA: Not set\n"
 
-# Save Account
-@bot.message_handler(func=lambda message: message.text == "📑 Save Account")
-def save_account_start(message):
-    user_id = message.chat.id
-    if not is_logged_in(user_id):
-        bot.send_message(user_id, "⚠️ আপনাকে প্রথমে লগইন করতে হবে। /start দিন।")
-        return
-    
-    msg = bot.send_message(user_id, "🏷️ এই অ্যাকাউন্টের জন্য একটি **নাম** নির্বাচন করুন (যেমন: gmail, fb, github):")
-    bot.register_next_step_handler(msg, get_account_name)
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return MAIN_MENU
 
-def get_account_name(message):
-    user_id = message.chat.id
-    account_name = message.text.strip().lower()
-    
-    acc_ref = db.reference(f'accounts/{user_id}/{account_name}')
-    existing = acc_ref.get()
-    if existing:
-        bot.send_message(user_id, "⚠️ এই নামে আগেই একটি অ্যাকাউন্ট আছে! ভিন্ন নাম দিন।")
-        msg = bot.send_message(user_id, "নতুন নাম লিখুন:")
-        bot.register_next_step_handler(msg, get_account_name)
-        return
-    
-    temp_ref = db.reference(f'temp_save/{user_id}')
-    temp_ref.set({"acc_name": account_name})
-    msg = bot.send_message(user_id, "👤 ইউজারনেম লিখুন:")
-    bot.register_next_step_handler(msg, get_username)
+# ─────────────────────────────────────────────
+# SECURITY VERIFY STATE
+# ─────────────────────────────────────────────
+async def verify_password_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    entered = update.message.text.strip()
+    owner_uid = context.user_data.get("security_check_owner_uid")
+    name = context.user_data.get("security_check_name")
 
-def get_username(message):
-    user_id = message.chat.id
-    username = message.text.strip()
-    temp_ref = db.reference(f'temp_save/{user_id}')
-    temp_ref.update({"username": username})
-    msg = bot.send_message(user_id, "🔑 পাসওয়ার্ড লিখুন:")
-    bot.register_next_step_handler(msg, get_password)
+    if not owner_uid:
+        await update.message.reply_text("Something went wrong. Use /start.")
+        return ConversationHandler.END
 
-def get_password(message):
-    user_id = message.chat.id
-    password = message.text.strip()
-    temp_ref = db.reference(f'temp_save/{user_id}')
-    temp_ref.update({"password": password})
-    msg = bot.send_message(user_id, "🔐 2FA কী লিখুন (যদি না থাকে 'none' লিখুন):")
-    bot.register_next_step_handler(msg, get_twofa)
+    owner_data = fb_get(f"users/{owner_uid}")
+    correct_password = owner_data.get("password", "")
 
-def get_twofa(message):
-    user_id = message.chat.id
-    twofa = message.text.strip()
-    temp_ref = db.reference(f'temp_save/{user_id}')
-    temp_data = temp_ref.get()
-    
-    if temp_data:
-        save_account(
-            user_id,
-            temp_data["acc_name"],
-            temp_data["username"],
-            temp_data["password"],
-            twofa
+    if entered != correct_password:
+        # Spam + redirect
+        for _ in range(3):
+            await update.message.reply_text("🚫 *WRONG PASSWORD! Access Denied!*", parse_mode="Markdown")
+        await update.message.reply_text(
+            "⛔ Multiple wrong attempts detected. Returning to home...",
+            reply_markup=get_home_keyboard()
         )
-        temp_ref.delete()
-        bot.send_message(user_id, f"✅ অ্যাকাউন্ট `{temp_data['acc_name']}` সফলভাবে সংরক্ষণ করা হয়েছে!", parse_mode="Markdown")
+        return MAIN_MENU
+
+    # Correct — show the account
+    accounts = owner_data.get("accounts", {})
+    acc = accounts.get(name, {})
+    msg = (
+        f"📋 *Account:* `{name}`\n\n"
+        f"👤 Username: `{acc.get('username', 'N/A')}`\n"
+        f"🔑 Password: `{acc.get('password', 'N/A')}`\n"
+    )
+    if acc.get("2fa"):
+        msg += f"🔐 2FA Key: `{acc.get('2fa')}`\n"
     else:
-        bot.send_message(user_id, "❌ কিছু ভুল হয়েছে! আবার চেষ্টা করুন।")
+        msg += "🔐 2FA: Not set\n"
 
-# Your Account's
-@bot.message_handler(func=lambda message: message.text == "💝 Your Account's")
-def show_accounts(message):
-    user_id = message.chat.id
-    if not is_logged_in(user_id):
-        bot.send_message(user_id, "⚠️ লগইন করুন প্রথমে!")
-        return
-    
-    accounts = get_all_accounts(user_id)
-    if not accounts:
-        bot.send_message(user_id, "📭 এখনও কোনো অ্যাকাউন্ট সংরক্ষণ করা হয়নি।\n'📑 Save Account' দিয়ে সংরক্ষণ করুন।")
-        return
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for acc in accounts:
-        btn = InlineKeyboardButton(acc.capitalize(), callback_data=f"view_{acc}")
-        keyboard.add(btn)
-    
-    keyboard.add(InlineKeyboardButton("🗑️ অ্যাকাউন্ট ডিলিট", callback_data="delete_menu"))
-    keyboard.add(InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_to_menu"))
-    
-    bot.send_message(user_id, "📋 আপনার সংরক্ষিত অ্যাকাউন্টগুলোর তালিকা:", reply_markup=keyboard)
+    await update.message.reply_text(msg, parse_mode="Markdown")
+    return MAIN_MENU
 
-# View Account with Security
-@bot.callback_query_handler(func=lambda call: call.data.startswith("view_"))
-def view_account(call):
-    user_id = call.message.chat.id
-    account_name = call.data.split("_", 1)[1]
-    
-    temp_ref = db.reference(f'temp_view/{user_id}')
-    temp_ref.set({"account": account_name})
-    
-    bot.send_message(user_id, f"🔒 নিরাপত্তার জন্য আপনার মাস্টার পাসওয়ার্ড দিন:\n(যেটি Sign Up এ দিয়েছিলেন)")
-    msg = bot.send_message(user_id, "পাসওয়ার্ড লিখুন:")
-    bot.register_next_step_handler(msg, verify_master_password)
+# ─────────────────────────────────────────────
+# /remove <name> COMMAND
+# ─────────────────────────────────────────────
+async def remove_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
 
-def verify_master_password(message):
-    user_id = message.chat.id
-    entered_pass = message.text.strip()
-    
-    user_data = get_user_data(user_id)
-    if user_data and user_data.get("password") == entered_pass:
-        temp_ref = db.reference(f'temp_view/{user_id}')
-        temp_data = temp_ref.get()
-        if temp_data:
-            acc_name = temp_data["account"]
-            acc_details = get_account_details(user_id, acc_name)
-            if acc_details:
-                twofa_text = f"🔐 2FA: `{acc_details['twofa']}`" if acc_details.get('twofa') else "🔐 2FA: নেই"
-                msg_text = (
-                    f"📁 **অ্যাকাউন্ট:** `{acc_name}`\n\n"
-                    f"👤 ইউজারনেম: `{acc_details['username']}`\n"
-                    f"🔑 পাসওয়ার্ড: `{acc_details['password']}`\n"
-                    f"{twofa_text}"
-                )
-                bot.send_message(user_id, msg_text, parse_mode="Markdown")
-            else:
-                bot.send_message(user_id, "❌ অ্যাকাউন্ট পাওয়া যায়নি!")
-        temp_ref.delete()
+    if not is_logged_in(chat_id):
+        await update.message.reply_text("Please /start and login first.")
+        return MAIN_MENU
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/remove <account_name>`", parse_mode="Markdown")
+        return MAIN_MENU
+
+    name = context.args[0].strip()
+    acc = fb_get(f"users/{chat_id}/accounts/{name}")
+    if not acc:
+        await update.message.reply_text(f"❌ No account named *{name}* found.", parse_mode="Markdown")
+        return MAIN_MENU
+
+    fb_delete(f"users/{chat_id}/accounts/{name}")
+    await update.message.reply_text(
+        f"🗑️ Account *{name}* has been removed.",
+        parse_mode="Markdown",
+        reply_markup=get_home_keyboard()
+    )
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# CANCEL
+# ─────────────────────────────────────────────
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled.", reply_markup=get_home_keyboard())
+    return MAIN_MENU
+
+# ─────────────────────────────────────────────
+# FALLBACK for logged-in users typing anything
+# ─────────────────────────────────────────────
+async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_user.id
+    if is_logged_in(chat_id):
+        await update.message.reply_text(
+            "🤔 Unknown command. Use the menu buttons or:\n"
+            "• `/account <name>` — view saved account\n"
+            "• `/remove <name>` — delete saved account",
+            parse_mode="Markdown",
+            reply_markup=get_home_keyboard()
+        )
     else:
-        bot.send_message(user_id, "⚠️ **ভুল পাসওয়ার্ড!** অননুমোদিত প্রবেশ আটকানো হয়েছে।", parse_mode="Markdown")
-        bot.send_message(user_id, "🏠 হোম মেনুতে ফিরে আসছেন...", reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Please use /start to begin.")
+    return MAIN_MENU
 
-# Delete Menu
-@bot.callback_query_handler(func=lambda call: call.data == "delete_menu")
-def delete_menu(call):
-    user_id = call.message.chat.id
-    accounts = get_all_accounts(user_id)
-    if not accounts:
-        bot.send_message(user_id, "📭 ডিলিট করার মতো কোনো অ্যাকাউন্ট নেই।")
-        return
-    
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    for acc in accounts:
-        btn = InlineKeyboardButton(f"🗑️ {acc}", callback_data=f"del_{acc}")
-        keyboard.add(btn)
-    keyboard.add(InlineKeyboardButton("🔙 পেছনে", callback_data="back_to_accounts"))
-    
-    bot.edit_message_text("🗑️ ডিলিট করার জন্য অ্যাকাউন্ট নির্বাচন করুন:", user_id, call.message.message_id, reply_markup=keyboard)
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("del_"))
-def confirm_delete(call):
-    user_id = call.message.chat.id
-    account_name = call.data.split("_", 1)[1]
-    
-    delete_account(user_id, account_name)
-    bot.answer_callback_query(call.id, f"{account_name} ডিলিট করা হয়েছে!")
-    
-    accounts = get_all_accounts(user_id)
-    if accounts:
-        keyboard = InlineKeyboardMarkup(row_width=2)
-        for acc in accounts:
-            keyboard.add(InlineKeyboardButton(acc.capitalize(), callback_data=f"view_{acc}"))
-        keyboard.add(InlineKeyboardButton("🗑️ অ্যাকাউন্ট ডিলিট", callback_data="delete_menu"))
-        keyboard.add(InlineKeyboardButton("🔙 মেনুতে ফিরুন", callback_data="back_to_menu"))
-        bot.edit_message_text("✅ ডিলিট সম্পন্ন! বর্তমান অ্যাকাউন্ট তালিকা:", user_id, call.message.message_id, reply_markup=keyboard)
-    else:
-        bot.edit_message_text("📭 এখন কোনো অ্যাকাউন্ট নেই।", user_id, call.message.message_id)
-        bot.send_message(user_id, "🔙 মেনু:", reply_markup=main_menu_keyboard())
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            MAIN_MENU: [
+                CallbackQueryHandler(signup_start, pattern="^signup$"),
+                CallbackQueryHandler(login_start, pattern="^login$"),
+                MessageHandler(filters.Regex("^📑 𝙎𝙖𝙫𝙚 𝘼𝙘𝙘𝙤𝙪𝙣𝙩$"), menu_handler),
+                MessageHandler(filters.Regex("^💝 𝙔𝙤𝙪𝙧 𝘼𝙘𝙘𝙤𝙪𝙣𝙩'𝙨$"), menu_handler),
+                CommandHandler("account", view_account),
+                CommandHandler("remove", remove_account),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler),
+            ],
+            SIGNUP_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, signup_username)],
+            SIGNUP_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, signup_password)],
+            LOGIN_USERNAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
+            LOGIN_PASSWORD:  [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
+            SAVE_ACC_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, save_acc_name)],
+            SAVE_ACC_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_acc_username)],
+            SAVE_ACC_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_acc_password)],
+            SAVE_ACC_2FA:      [MessageHandler(filters.TEXT & ~filters.COMMAND, save_acc_2fa)],
+            VERIFY_PASSWORD:   [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_password_handler)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
 
-# Back to Menu
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
-def back_to_menu(call):
-    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-    bot.send_message(call.message.chat.id, "🔙 মূল মেনু:", reply_markup=main_menu_keyboard())
+    app.add_handler(conv)
 
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_accounts")
-def back_to_accounts(call):
-    show_accounts(call.message)
+    logger.info("Bot is running...")
+    app.run_polling()
 
-# Remove Command
-@bot.message_handler(commands=['remove'])
-def remove_command(message):
-    user_id = message.chat.id
-    if not is_logged_in(user_id):
-        bot.send_message(user_id, "লগইন করুন প্রথমে!")
-        return
-    
-    parts = message.text.split()
-    if len(parts) != 2:
-        bot.send_message(user_id, "⚠️ ব্যবহার: `/remove account_name`", parse_mode="Markdown")
-        return
-    
-    acc_name = parts[1].lower()
-    acc = get_account_details(user_id, acc_name)
-    if acc:
-        delete_account(user_id, acc_name)
-        bot.send_message(user_id, f"✅ `{acc_name}` ডিলিট করা হয়েছে!", parse_mode="Markdown")
-    else:
-        bot.send_message(user_id, "❌ এই নামে কোনো অ্যাকাউন্ট নেই!")
-
-# Run Bot
 if __name__ == "__main__":
-    print("🤖 Bot is running with Firebase Admin SDK...")
-    bot.infinity_polling()
+    main()
+    
